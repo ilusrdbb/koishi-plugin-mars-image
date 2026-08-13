@@ -1,0 +1,30 @@
+{
+  "name": "koishi-plugin-mars-images",
+  "version": "1.0.0",
+  "description": "QQ 群图片火星检测与次数统计",
+  "main": "lib/index.js",
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "keywords": [
+    "koishi",
+    "plugin",
+    "qq",
+    "image",
+    "dedup"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.18.0"
+  },
+  "dependencies": {
+    "jimp": "^0.22.12"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "koishi": "^4.18.0",
+    "typescript": "^5.5.0"
+  }
+}
