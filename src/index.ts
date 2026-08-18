@@ -8,6 +8,8 @@ export interface Config {
   threshold: number
   notify: boolean
   marsMessage: string
+  forwardMessage: string
+  forwardMaxImages: number
   statsCommand: string
   statsHeader: string
   statsEmpty: string
@@ -27,6 +29,12 @@ export const Config: Schema<Config> = Schema.object({
   marsMessage: Schema.string()
     .default('{at} 火星了！这张图 {time} 由 {user} 发过（你已 {count} 次）')
     .description('火星提示语。占位符:{at}=@对方 {user}=原发送者 {time}=原发送时间 {count}=对方累计火星次数'),
+  forwardMessage: Schema.string()
+    .default('{at} 火星了！这个转发卡片里的 {n} 张图都发过，最早 {time} 由 {user} 发的（你已 {count} 次）')
+    .description('转发卡片火星提示语。占位符:{at}=@对方 {n}=卡片内图片数 {user}=最早发送者 {time}=最早发送时间 {count}=对方累计火星次数'),
+  forwardMaxImages: Schema.number()
+    .min(1).max(100).step(1).default(30)
+    .description('转发卡片最多检测多少张图片,超出部分忽略'),
   statsCommand: Schema.string()
     .default('火星统计')
     .description('发送此文本(完全相等)触发统计'),
@@ -98,42 +106,54 @@ export function apply(ctx: Context, config: Config) {
 
     const elements = session.elements ?? []
     const imgs = elements.filter((e) => e.type === 'image' || e.type === 'img')
-    if (!imgs.length) {
+    const forwards = elements.filter((e) => e.type === 'forward')
+
+    if (!imgs.length && !forwards.length) {
       // 有非文本元素却没识别到图片时,打印元素类型辅助排查
       if (elements.some((e) => e.type !== 'text')) {
         logger.info(`未识别到图片,元素类型: ${elements.map((e) => e.type).join(',')}`)
       }
       return
     }
-    logger.info(`收到 ${imgs.length} 张图片, gid=${gid}`)
 
-    for (const img of imgs) {
-      const buf = await extractImage(ctx, img, logger)
-      if (!buf) {
-        logger.warn('图片解析失败,跳过')
+    if (imgs.length) {
+      logger.info(`收到 ${imgs.length} 张图片, gid=${gid}`)
+      for (const img of imgs) {
+        const buf = await extractImage(ctx, img, logger)
+        if (!buf) {
+          logger.warn('图片解析失败,跳过')
+          continue
+        }
+        try {
+          const hash = await dHash(buf)
+          logger.info(`图片 dHash=${hash}`)
+          await processImage(session, gid, hash)
+        } catch (e) {
+          logger.warn('图片哈希计算失败', e)
+        }
+      }
+    }
+
+    for (const fwd of forwards) {
+      const id = fwd.attrs?.id ?? fwd.attrs?.resId
+      if (!id) {
+        logger.warn('转发卡片缺少 id,跳过')
         continue
       }
-      try {
-        const hash = await dHash(buf)
-        logger.info(`图片 dHash=${hash}`)
-        await processImage(session, gid, hash)
-      } catch (e) {
-        logger.warn('图片哈希计算失败', e)
-      }
+      await handleForwardCard(session, gid, String(id))
     }
   })
 
-  async function processImage(session: any, gid: string, hash: string) {
-    const now = Date.now()
-    const windowMs = config.windowDays * 24 * 3600 * 1000
-    const cutoff = now - windowMs
-
+  async function getWindowRows(gid: string): Promise<MarsImageRow[]> {
+    const cutoff = Date.now() - config.windowDays * 24 * 3600 * 1000
     // 清理窗口外旧记录
     await db.remove('mars_image', { gid, time: { $lt: cutoff } })
-
     const rows = (await db.get('mars_image', { gid, time: { $gt: cutoff } })) as MarsImageRow[]
     logger.info(`窗口内已有 ${rows.length} 张图片`)
+    return rows
+  }
 
+  function findMatch(hash: string, rows: MarsImageRow[]): { match: MarsImageRow | null; dist: number } {
     let match: MarsImageRow | null = null
     let bestDist = Infinity
     for (const r of rows) {
@@ -143,28 +163,97 @@ export function apply(ctx: Context, config: Config) {
         match = r
       }
     }
+    return { match, dist: bestDist }
+  }
+
+  async function saveImage(gid: string, session: any, hash: string, time: number) {
+    await db.create('mars_image', {
+      gid,
+      hash,
+      userId: session.userId,
+      userName: session.username || session.userId,
+      time,
+    })
+  }
+
+  async function notifyMars(session: any, gid: string, match: MarsImageRow, tpl: string, extra: Record<string, string> = {}) {
+    const entry = await incMars(gid, session.userId, session.username)
+    if (!config.notify) return
+    const msg = renderMars(tpl, {
+      at: h('at', { id: session.userId }),
+      user: match.userName,
+      time: formatTime(match.time),
+      count: entry.count,
+      ...extra,
+    })
+    await session.send(msg)
+  }
+
+  async function processImage(session: any, gid: string, hash: string) {
+    const rows = await getWindowRows(gid)
+    const { match, dist } = findMatch(hash, rows)
 
     if (match) {
-      logger.info(`命中重复,原发送者 ${match.userName},汉明距离 ${bestDist}`)
-      const entry = await incMars(gid, session.userId, session.username)
-      if (config.notify) {
-        const msg = renderMars(config.marsMessage, {
-          at: h('at', { id: session.userId }),
-          user: match.userName,
-          time: formatTime(match.time),
-          count: entry.count,
-        })
-        await session.send(msg)
-      }
+      logger.info(`命中重复,原发送者 ${match.userName},汉明距离 ${dist}`)
+      await notifyMars(session, gid, match, config.marsMessage)
     } else {
       logger.info('未命中,存入新图片记录')
-      await db.create('mars_image', {
-        gid,
-        hash,
-        userId: session.userId,
-        userName: session.username || session.userId,
-        time: now,
-      })
+      await saveImage(gid, session, hash, Date.now())
+    }
+  }
+
+  // 转发卡片:卡片内全部图片都命中重复才算一次火星;否则不算,并把其中的新图片存档
+  async function handleForwardCard(session: any, gid: string, id: string) {
+    const internal = (session.bot as any)?.internal
+    if (typeof internal?.getForwardMsg !== 'function') {
+      logger.warn('当前适配器不支持 getForwardMsg,跳过转发卡片检测')
+      return
+    }
+
+    const segs = await collectForwardImages(internal, id, 0, new Set<string>(), logger)
+    if (!segs.length) {
+      logger.info(`转发卡片 ${id} 内未找到图片`)
+      return
+    }
+    const limited = segs.slice(0, config.forwardMaxImages)
+    if (segs.length > limited.length) {
+      logger.info(`转发卡片图片数 ${segs.length} 超过上限 ${config.forwardMaxImages},只检测前 ${limited.length} 张`)
+    }
+    logger.info(`转发卡片 ${id} 提取到 ${limited.length} 张图片`)
+
+    const hashes: string[] = []
+    for (const attrs of limited) {
+      const buf = await extractImage(ctx, { attrs }, logger)
+      if (!buf) {
+        logger.warn('转发卡片内图片解析失败,视为未命中')
+        continue
+      }
+      try {
+        hashes.push(await dHash(buf))
+      } catch (e) {
+        logger.warn('转发卡片内图片哈希计算失败', e)
+      }
+    }
+    // 有图片下载/哈希失败时无法确认"全部命中",直接放弃本次判定
+    if (hashes.length !== limited.length) {
+      logger.warn(`仅成功处理 ${hashes.length}/${limited.length} 张,跳过本次转发卡片判定`)
+      return
+    }
+
+    const rows = await getWindowRows(gid)
+    const results = hashes.map((hash) => ({ hash, ...findMatch(hash, rows) }))
+    const matched = results.filter((r) => r.match)
+
+    if (matched.length === results.length) {
+      logger.info(`转发卡片 ${results.length} 张图片全部命中重复,记 1 次火星`)
+      const earliest = matched.reduce((a, b) => (a.match!.time <= b.match!.time ? a : b))
+      await notifyMars(session, gid, earliest.match!, config.forwardMessage, { n: String(results.length) })
+    } else {
+      logger.info(`转发卡片命中 ${matched.length}/${results.length} 张,不算火星,存档新图片`)
+      const now = Date.now()
+      for (const r of results) {
+        if (!r.match) await saveImage(gid, session, r.hash, now)
+      }
     }
   }
 
@@ -214,6 +303,96 @@ async function extractImage(ctx: Context, img: any, logger: any): Promise<Buffer
     logger.warn(`图片下载异常: ${String(url).slice(0, 120)}`, e)
     return null
   }
+}
+
+// 合并转发嵌套层数上限,防止套娃卡片打爆递归
+const FORWARD_MAX_DEPTH = 3
+
+// 递归展开合并转发卡片,收集其中全部图片消息段的 data(含 url/file)
+async function collectForwardImages(
+  internal: any,
+  id: string,
+  depth: number,
+  seen: Set<string>,
+  logger: any,
+): Promise<any[]> {
+  if (depth > FORWARD_MAX_DEPTH || seen.has(id)) return []
+  seen.add(id)
+
+  let messages: any
+  try {
+    messages = await internal.getForwardMsg(id)
+  } catch (e) {
+    logger.warn(`获取转发卡片 ${id} 内容失败`, e)
+    return []
+  }
+  if (!Array.isArray(messages)) {
+    logger.warn(`转发卡片 ${id} 返回结构异常: ${JSON.stringify(messages).slice(0, 200)}`)
+    return []
+  }
+
+  const out: any[] = []
+  for (const msg of messages) {
+    // go-cqhttp 用 content,NapCat/LLOneBot 用 message
+    out.push(...(await collectSegmentImages(internal, msg?.content ?? msg?.message, depth, seen, logger)))
+  }
+  return out
+}
+
+async function collectSegmentImages(
+  internal: any,
+  content: any,
+  depth: number,
+  seen: Set<string>,
+  logger: any,
+): Promise<any[]> {
+  const out: any[] = []
+  for (const seg of parseSegments(content)) {
+    if (seg.type === 'image') {
+      out.push(seg.data || {})
+      continue
+    }
+    if (seg.type !== 'forward' && seg.type !== 'node') continue
+    // 部分实现直接内联嵌套内容,无需再请求
+    const inline = seg.data?.content ?? seg.data?.message
+    if (inline) {
+      out.push(...(await collectSegmentImages(internal, inline, depth + 1, seen, logger)))
+    } else if (seg.data?.id) {
+      out.push(...(await collectForwardImages(internal, String(seg.data.id), depth + 1, seen, logger)))
+    }
+  }
+  return out
+}
+
+// content 可能是 CQ 码字符串(go-cqhttp)或消息段数组(NapCat 等)
+function parseSegments(content: any): Array<{ type: string; data: any }> {
+  if (Array.isArray(content)) {
+    return content.filter((s) => s && typeof s === 'object' && s.type).map((s) => ({ type: s.type, data: s.data ?? {} }))
+  }
+  if (typeof content !== 'string') return []
+
+  const segs: Array<{ type: string; data: any }> = []
+  const pattern = /\[CQ:([a-zA-Z0-9_-]+)((?:,[^,\]]*)*)\]/g
+  let cap: RegExpExecArray | null
+  while ((cap = pattern.exec(content))) {
+    const data: Record<string, string> = {}
+    for (const pair of cap[2].split(',')) {
+      if (!pair) continue
+      const i = pair.indexOf('=')
+      if (i < 0) continue
+      data[pair.slice(0, i)] = unescapeCQ(pair.slice(i + 1))
+    }
+    segs.push({ type: cap[1], data })
+  }
+  return segs
+}
+
+function unescapeCQ(s: string): string {
+  return s
+    .replace(/&#44;/g, ',')
+    .replace(/&#91;/g, '[')
+    .replace(/&#93;/g, ']')
+    .replace(/&amp;/g, '&')
 }
 
 function toBuffer(data: any): Buffer | null {
@@ -267,12 +446,10 @@ function hammingDistance(a: string, b: string): number {
   return d
 }
 
-function renderMars(tpl: string, vars: { at: any; user: string; time: string; count: number }): any {
+function renderMars(tpl: string, vars: { at: any; user: string; time: string; count: number; [k: string]: any }): any {
   const text = tpl.replace(/\{(\w+)\}/g, (m, k: string) => {
     if (k === 'at') return `<at id="${vars.at.attrs.id}"/>`
-    if (k === 'user') return vars.user
-    if (k === 'time') return vars.time
-    if (k === 'count') return String(vars.count)
+    if (k in vars) return String(vars[k])
     return m
   })
   return h.parse(text)
