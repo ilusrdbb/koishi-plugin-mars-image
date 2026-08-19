@@ -29,9 +29,9 @@ npm run build
 | `windowDays` | `7` | 图片记录窗口(天),1-7 |
 | `threshold` | `90` | 重复判定相似度阈值(%) |
 | `notify` | `true` | 火星时是否发提示;`false` 静默记录,仍累计次数 |
-| `minImageBytes` | `0` | 图片最小体积(字节),低于则忽略;`0` 不限制 |
-| `minImageWidth` | `0` | 图片最小宽度(像素),低于则忽略;`0` 不限制 |
-| `minImageHeight` | `0` | 图片最小高度(像素),低于则忽略;`0` 不限制 |
+| `minImageBytes` | `0` | 图片最小体积(KB),宽高不达标时检查;`0` 表示宽高不达标时也不限制体积 |
+| `minImageWidth` | `360` | 图片最小宽度(像素),必须大于 0 |
+| `minImageHeight` | `360` | 图片最小高度(像素),必须大于 0 |
 | `marsMessage` | `{at} 火星了！这张图 {time} 由 {user} 发过（你已 {count} 次）` | 火星提示语 |
 | `statsCommand` | `火星统计` | 触发统计的文本 |
 | `statsHeader` | `🔥 火星次数统计：` | 统计标题 |

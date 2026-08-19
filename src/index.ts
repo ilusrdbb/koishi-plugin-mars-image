@@ -30,14 +30,14 @@ export const Config: Schema<Config> = Schema.object({
     .default(true)
     .description('火星时是否发提示;关闭后仍正常记录次数'),
   minImageBytes: Schema.number()
-    .min(0).max(50 * 1024 * 1024).step(1024).default(0)
-    .description('图片最小体积(字节),低于则忽略;设为 0 不限制'),
+    .min(0).max(50 * 1024).step(1).default(0)
+    .description('图片最小体积(KB),宽高不达标时检查;设为 0 不限制'),
   minImageWidth: Schema.number()
-    .min(0).max(10000).step(1).default(64)
-    .description('图片最小宽度(像素),低于则忽略;设为 0 不限制'),
+    .min(1).max(10000).step(1).default(360)
+    .description('图片最小宽度(像素),必须大于 0'),
   minImageHeight: Schema.number()
-    .min(0).max(10000).step(1).default(64)
-    .description('图片最小高度(像素),低于则忽略;设为 0 不限制'),
+    .min(1).max(10000).step(1).default(360)
+    .description('图片最小高度(像素),必须大于 0'),
   marsMessage: Schema.string()
     .default('{at} 火星了！这张图 {time} 由 {user} 发过（你已 {count} 次）')
     .description('火星提示语。占位符:{at}=@对方 {user}=原发送者 {time}=原发送时间 {count}=对方累计火星次数'),
@@ -329,18 +329,22 @@ function isNativeEmoji(element: any): boolean {
 
 async function validateImage(buf: Buffer, config: Config | undefined, logger: any): Promise<boolean> {
   if (!config) return true
-  if (config.minImageBytes > 0 && buf.length < config.minImageBytes) {
-    logger.info(`图片体积 ${buf.length} 字节低于下限 ${config.minImageBytes},跳过`)
-    return false
-  }
   try {
     const Jimp = await loadJimp()
     const img = await Jimp.read(buf)
     const width = img.bitmap.width
     const height = img.bitmap.height
     logger.info(`图片信息: ${buf.length} 字节, ${width}x${height}`)
-    if (config.minImageWidth > 0 && width < config.minImageWidth || config.minImageHeight > 0 && height < config.minImageHeight) {
-      logger.info(`图片尺寸 ${width}x${height} 小于最低 ${config.minImageWidth}x${config.minImageHeight},跳过`)
+
+    const dimensionsValid = width >= config.minImageWidth && height >= config.minImageHeight
+    if (dimensionsValid) {
+      logger.info(`图片宽高 ${width}x${height} 同时达到最低 ${config.minImageWidth}x${config.minImageHeight},跳过火星检测`)
+      return false
+    }
+
+    const minBytes = config.minImageBytes * 1024
+    if (minBytes > 0 && buf.length < minBytes) {
+      logger.info(`图片体积 ${formatBytes(buf.length)} 低于 ${config.minImageBytes} KB,跳过火星检测`)
       return false
     }
     return true
@@ -348,6 +352,10 @@ async function validateImage(buf: Buffer, config: Config | undefined, logger: an
     logger.warn('图片尺寸读取失败,跳过', e)
     return false
   }
+}
+
+function formatBytes(bytes: number): string {
+  return `${(bytes / 1024).toFixed(1)} KB`
 }
 
 // 合并转发嵌套层数上限,防止套娃卡片打爆递归
