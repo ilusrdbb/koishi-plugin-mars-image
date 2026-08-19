@@ -336,9 +336,9 @@ async function validateImage(buf: Buffer, config: Config | undefined, logger: an
     const height = img.bitmap.height
     logger.info(`图片信息: ${buf.length} 字节, ${width}x${height}`)
 
-    const dimensionsValid = width >= config.minImageWidth && height >= config.minImageHeight
-    if (dimensionsValid) {
-      logger.info(`图片宽高 ${width}x${height} 同时达到最低 ${config.minImageWidth}x${config.minImageHeight},跳过火星检测`)
+    const dimensionsTooSmall = width < config.minImageWidth && height < config.minImageHeight
+    if (dimensionsTooSmall) {
+      logger.info(`图片宽高 ${width}x${height} 均低于最低 ${config.minImageWidth}x${config.minImageHeight},跳过火星检测`)
       return false
     }
 
