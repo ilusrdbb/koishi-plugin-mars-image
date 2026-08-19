@@ -333,12 +333,12 @@ async function validateImage(buf: Buffer, config: Config | undefined, logger: an
     logger.info(`图片体积 ${buf.length} 字节低于下限 ${config.minImageBytes},跳过`)
     return false
   }
-  if (!config.minImageWidth && !config.minImageHeight) return true
   try {
     const Jimp = await loadJimp()
     const img = await Jimp.read(buf)
     const width = img.bitmap.width
     const height = img.bitmap.height
+    logger.info(`图片信息: ${buf.length} 字节, ${width}x${height}`)
     if (config.minImageWidth > 0 && width < config.minImageWidth || config.minImageHeight > 0 && height < config.minImageHeight) {
       logger.info(`图片尺寸 ${width}x${height} 小于最低 ${config.minImageWidth}x${config.minImageHeight},跳过`)
       return false
