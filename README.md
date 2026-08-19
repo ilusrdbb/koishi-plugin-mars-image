@@ -29,6 +29,9 @@ npm run build
 | `windowDays` | `7` | 图片记录窗口(天),1-7 |
 | `threshold` | `90` | 重复判定相似度阈值(%) |
 | `notify` | `true` | 火星时是否发提示;`false` 静默记录,仍累计次数 |
+| `minImageBytes` | `0` | 图片最小体积(字节),低于则忽略;`0` 不限制 |
+| `minImageWidth` | `0` | 图片最小宽度(像素),低于则忽略;`0` 不限制 |
+| `minImageHeight` | `0` | 图片最小高度(像素),低于则忽略;`0` 不限制 |
 | `marsMessage` | `{at} 火星了！这张图 {time} 由 {user} 发过（你已 {count} 次）` | 火星提示语 |
 | `statsCommand` | `火星统计` | 触发统计的文本 |
 | `statsHeader` | `🔥 火星次数统计：` | 统计标题 |
@@ -43,6 +46,8 @@ npm run build
 - 下载图片用 `ctx.http.get` 抓 `url`/`src`/`file`(支持 `base64://`)。
 - 数据存 Koishi 数据库(需启用 sqlite 驱动),两张表:`mars_image`(图片哈希记录)、`mars_count`(火星次数)。重启保留。
 - 同一哈希只保留「首次发送者 + 时间」作为火星对象,不重复记录。
+- `face`、`emoji` 等原生表情默认忽略,不下载、不哈希、不计数。
+- 图片过滤同时作用于普通消息和转发卡片:先按字节数过滤,再按解码后的宽高过滤。
 
 ## 已知限制
 

@@ -7,6 +7,9 @@ export interface Config {
   windowDays: number
   threshold: number
   notify: boolean
+  minImageBytes: number
+  minImageWidth: number
+  minImageHeight: number
   marsMessage: string
   forwardMessage: string
   forwardMaxImages: number
@@ -26,6 +29,15 @@ export const Config: Schema<Config> = Schema.object({
   notify: Schema.boolean()
     .default(true)
     .description('火星时是否发提示;关闭后仍正常记录次数'),
+  minImageBytes: Schema.number()
+    .min(0).max(50 * 1024 * 1024).step(1024).default(0)
+    .description('图片最小体积(字节),低于则忽略;设为 0 不限制'),
+  minImageWidth: Schema.number()
+    .min(0).max(10000).step(1).default(64)
+    .description('图片最小宽度(像素),低于则忽略;设为 0 不限制'),
+  minImageHeight: Schema.number()
+    .min(0).max(10000).step(1).default(64)
+    .description('图片最小高度(像素),低于则忽略;设为 0 不限制'),
   marsMessage: Schema.string()
     .default('{at} 火星了！这张图 {time} 由 {user} 发过（你已 {count} 次）')
     .description('火星提示语。占位符:{at}=@对方 {user}=原发送者 {time}=原发送时间 {count}=对方累计火星次数'),
@@ -105,7 +117,9 @@ export function apply(ctx: Context, config: Config) {
     }
 
     const elements = session.elements ?? []
-    const imgs = elements.filter((e) => e.type === 'image' || e.type === 'img')
+    const imgs = elements.filter((e) => (e.type === 'image' || e.type === 'img') && !isNativeEmoji(e))
+    const ignoredEmojiCount = elements.filter((e) => isNativeEmoji(e)).length
+    if (ignoredEmojiCount) logger.info(`忽略 ${ignoredEmojiCount} 个原生表情`)
     const forwards = elements.filter((e) => e.type === 'forward')
 
     if (!imgs.length && !forwards.length) {
@@ -119,7 +133,7 @@ export function apply(ctx: Context, config: Config) {
     if (imgs.length) {
       logger.info(`收到 ${imgs.length} 张图片, gid=${gid}`)
       for (const img of imgs) {
-        const buf = await extractImage(ctx, img, logger)
+        const buf = await extractImage(ctx, img, logger, config)
         if (!buf) {
           logger.warn('图片解析失败,跳过')
           continue
@@ -223,7 +237,7 @@ export function apply(ctx: Context, config: Config) {
 
     const hashes: string[] = []
     for (const attrs of limited) {
-      const buf = await extractImage(ctx, { attrs }, logger)
+      const buf = await extractImage(ctx, { attrs }, logger, config)
       if (!buf) {
         logger.warn('转发卡片内图片解析失败,视为未命中')
         continue
@@ -283,12 +297,15 @@ export function apply(ctx: Context, config: Config) {
   }
 }
 
-async function extractImage(ctx: Context, img: any, logger: any): Promise<Buffer | null> {
+async function extractImage(ctx: Context, img: any, logger: any, config?: Config): Promise<Buffer | null> {
   const a = img.attrs || {}
   const url = a.url || a.src || a.file
   logger.info(`图片 attrs: ${JSON.stringify(a)}`)
   if (!url) return null
-  if (url.startsWith('base64://')) return Buffer.from(url.slice(9), 'base64')
+  if (url.startsWith('base64://')) {
+    const buf = Buffer.from(url.slice(9), 'base64')
+    return (await validateImage(buf, config, logger)) ? buf : null
+  }
   if (!/^https?:\/\//.test(url)) {
     logger.warn(`图片 url 非 http/base64,无法下载: ${String(url).slice(0, 120)}`)
     return null
@@ -298,10 +315,38 @@ async function extractImage(ctx: Context, img: any, logger: any): Promise<Buffer
     const buf = toBuffer(data)
     if (!buf) logger.warn('下载结果转 Buffer 失败')
     else logger.info(`图片下载成功, ${buf.length} 字节`)
-    return buf
+    if (!buf) return null
+    return (await validateImage(buf, config, logger)) ? buf : null
   } catch (e) {
     logger.warn(`图片下载异常: ${String(url).slice(0, 120)}`, e)
     return null
+  }
+}
+
+function isNativeEmoji(element: any): boolean {
+  return ['face', 'mface', 'marketface', 'sticker', 'emoji'].includes(element?.type)
+}
+
+async function validateImage(buf: Buffer, config: Config | undefined, logger: any): Promise<boolean> {
+  if (!config) return true
+  if (config.minImageBytes > 0 && buf.length < config.minImageBytes) {
+    logger.info(`图片体积 ${buf.length} 字节低于下限 ${config.minImageBytes},跳过`)
+    return false
+  }
+  if (!config.minImageWidth && !config.minImageHeight) return true
+  try {
+    const Jimp = await loadJimp()
+    const img = await Jimp.read(buf)
+    const width = img.bitmap.width
+    const height = img.bitmap.height
+    if (config.minImageWidth > 0 && width < config.minImageWidth || config.minImageHeight > 0 && height < config.minImageHeight) {
+      logger.info(`图片尺寸 ${width}x${height} 小于最低 ${config.minImageWidth}x${config.minImageHeight},跳过`)
+      return false
+    }
+    return true
+  } catch (e) {
+    logger.warn('图片尺寸读取失败,跳过', e)
+    return false
   }
 }
 
