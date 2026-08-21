@@ -415,7 +415,7 @@ function formatBytes(bytes: number): string {
 }
 
 // 合并转发嵌套层数上限,防止套娃卡片打爆递归
-const FORWARD_MAX_DEPTH = 3
+const FORWARD_MAX_DEPTH = 6
 
 // 递归展开合并转发卡片,收集其中全部图片消息段的 data(含 url/file)
 async function collectForwardImages(
@@ -442,10 +442,21 @@ async function collectForwardImages(
 
   const out: any[] = []
   for (const msg of messages) {
-    // go-cqhttp 用 content,NapCat/LLOneBot 用 message
-    out.push(...(await collectSegmentImages(internal, msg?.content ?? msg?.message, depth, seen, logger)))
+    // go-cqhttp 用 content,NapCat/LLOneBot 用 message;取非空的那个
+    out.push(...(await collectSegmentImages(internal, pickSegments(msg), depth, seen, logger)))
   }
   return out
+}
+
+// 兼容不同适配器对转发内单条消息的字段差异,取有内容的那个
+function pickSegments(msg: any): any {
+  const c = msg?.content
+  const m = msg?.message
+  if (Array.isArray(m) && m.length) return m
+  if (Array.isArray(c) && c.length) return c
+  if (typeof m === 'string' && m.trim()) return m
+  if (typeof c === 'string' && c.trim()) return c
+  return m ?? c
 }
 
 async function collectSegmentImages(
@@ -466,19 +477,33 @@ async function collectSegmentImages(
     const inline = seg.data?.content ?? seg.data?.message
     if (inline) {
       out.push(...(await collectSegmentImages(internal, inline, depth + 1, seen, logger)))
-    } else if (seg.data?.id) {
-      out.push(...(await collectForwardImages(internal, String(seg.data.id), depth + 1, seen, logger)))
+      continue
+    }
+    // 嵌套卡片按 id 展开;兼容 id / res_id / resId 三种字段
+    const rid = seg.data?.id ?? seg.data?.res_id ?? seg.data?.resId
+    if (rid) {
+      out.push(...(await collectForwardImages(internal, String(rid), depth + 1, seen, logger)))
     }
   }
   return out
 }
 
-// content 可能是 CQ 码字符串(go-cqhttp)或消息段数组(NapCat 等)
+// content 可能是 CQ 码字符串(go-cqhttp)、消息段数组(NapCat 等)或 JSON 编码的数组字符串
 function parseSegments(content: any): Array<{ type: string; data: any }> {
   if (Array.isArray(content)) {
     return content.filter((s) => s && typeof s === 'object' && s.type).map((s) => ({ type: s.type, data: s.data ?? {} }))
   }
   if (typeof content !== 'string') return []
+
+  // 部分实现把 content 序列化成 JSON 数组字符串
+  if (content.trimStart().startsWith('[')) {
+    try {
+      const parsed = JSON.parse(content)
+      if (Array.isArray(parsed)) return parseSegments(parsed)
+    } catch {
+      // 不是合法 JSON,走 CQ 码解析
+    }
+  }
 
   const segs: Array<{ type: string; data: any }> = []
   const pattern = /\[CQ:([a-zA-Z0-9_-]+)((?:,[^,\]]*)*)\]/g
