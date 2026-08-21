@@ -440,6 +440,12 @@ async function collectForwardImages(
     return []
   }
 
+  // 诊断:打印展开结构和原始内容,便于排查抓取不到图片的问题
+  logger.info(`转发卡片 ${id} 展开 ${messages.length} 条`)
+  for (const msg of messages.slice(0, 3)) {
+    logger.info(`  转发消息原始: ${JSON.stringify(msg?.message ?? msg?.content ?? msg).slice(0, 300)}`)
+  }
+
   const out: any[] = []
   for (const msg of messages) {
     // go-cqhttp 用 content,NapCat/LLOneBot 用 message;取非空的那个
@@ -491,7 +497,19 @@ async function collectSegmentImages(
 // content 可能是 CQ 码字符串(go-cqhttp)、消息段数组(NapCat 等)或 JSON 编码的数组字符串
 function parseSegments(content: any): Array<{ type: string; data: any }> {
   if (Array.isArray(content)) {
-    return content.filter((s) => s && typeof s === 'object' && s.type).map((s) => ({ type: s.type, data: s.data ?? {} }))
+    const segs: Array<{ type: string; data: any }> = []
+    for (const s of content) {
+      if (!s || typeof s !== 'object') continue
+      // 标准消息段 {type,data}
+      if (s.type) {
+        segs.push({ type: s.type, data: s.data ?? {} })
+        continue
+      }
+      // 原始消息对象(嵌套卡片的 content/getForwardMsg 返回):取其 message/content 字段当 node 递归
+      const inner = s.message ?? s.content
+      if (inner) segs.push({ type: 'node', data: { content: inner } })
+    }
+    return segs
   }
   if (typeof content !== 'string') return []
 
