@@ -13,6 +13,7 @@ export interface Config {
   marsMessage: string
   forwardMessage: string
   forwardMaxImages: number
+  forwardMarsThreshold: number
   repeatWindowSeconds: number
   repeatLimit: number
   cooldownSeconds: number
@@ -45,11 +46,14 @@ export const Config: Schema<Config> = Schema.object({
     .default('{at} 火星了！这张图 {time} 由 {user} 发过（你已 {count} 次）')
     .description('火星提示语。占位符:{at}=@对方 {user}=原发送者 {time}=原发送时间 {count}=对方累计火星次数'),
   forwardMessage: Schema.string()
-    .default('{at} 火星了！这个转发卡片里的 {n} 张图都发过，最早 {time} 由 {user} 发的（你已 {count} 次）')
-    .description('转发卡片火星提示语。占位符:{at}=@对方 {n}=卡片内图片数 {user}=最早发送者 {time}=最早发送时间 {count}=对方累计火星次数'),
+    .default('{at} 火星了！这个转发卡片里 {n} 张图都发过，最早 {time} 由 {user} 发的（你已 {count} 次）')
+    .description('转发卡片火星提示语。占位符:{at}=@对方 {n}=命中重复图片数 {user}=最早发送者 {time}=最早发送时间 {count}=对方累计火星次数'),
   forwardMaxImages: Schema.number()
     .min(1).max(100).step(1).default(30)
     .description('转发卡片最多检测多少张图片,超出部分忽略'),
+  forwardMarsThreshold: Schema.number()
+    .min(1).max(100).step(1).default(5)
+    .description('转发卡片火星阈值:命中重复的图片数达到此值,或全部图片都命中(图片少于阈值时),记 1 次火星;必须大于 0'),
   repeatWindowSeconds: Schema.number()
     .min(0).max(3600).step(1).default(60)
     .description('复读规避窗口(秒);设为 0 取消规避'),
@@ -293,7 +297,8 @@ export function apply(ctx: Context, config: Config) {
 
     const hashes: string[] = []
     for (const attrs of limited) {
-      const buf = await extractImage(ctx, { attrs }, logger, config)
+      // 卡片内图片不做体积/宽高过滤,强制火星判定
+      const buf = await extractImage(ctx, { attrs }, logger)
       if (!buf) {
         logger.warn('转发卡片内图片解析失败,视为未命中')
         continue
@@ -304,7 +309,7 @@ export function apply(ctx: Context, config: Config) {
         logger.warn('转发卡片内图片哈希计算失败', e)
       }
     }
-    // 有图片下载/哈希失败时无法确认"全部命中",直接放弃本次判定
+    // 有图片下载/哈希失败时无法确认命中情况,直接放弃本次判定
     if (hashes.length !== limited.length) {
       logger.warn(`仅成功处理 ${hashes.length}/${limited.length} 张,跳过本次转发卡片判定`)
       return
@@ -314,12 +319,14 @@ export function apply(ctx: Context, config: Config) {
     const results = hashes.map((hash) => ({ hash, ...findMatch(hash, rows) }))
     const matched = results.filter((r) => r.match)
 
-    if (matched.length === results.length) {
-      logger.info(`转发卡片 ${results.length} 张图片全部命中重复,记 1 次火星`)
+    // 命中数 >= 阈值,或全部命中(卡片内图片少于阈值时),记 1 次火星
+    const threshold = Math.min(config.forwardMarsThreshold, results.length)
+    if (matched.length >= threshold) {
+      logger.info(`转发卡片命中重复 ${matched.length}/${results.length} 张,达阈值,记 1 次火星`)
       const earliest = matched.reduce((a, b) => (a.match!.time <= b.match!.time ? a : b))
-      await notifyMars(session, gid, earliest.match!, config.forwardMessage, { n: String(results.length) })
+      await notifyMars(session, gid, earliest.match!, config.forwardMessage, { n: String(matched.length) })
     } else {
-      logger.info(`转发卡片命中 ${matched.length}/${results.length} 张,不算火星,存档新图片`)
+      logger.info(`转发卡片命中 ${matched.length}/${results.length} 张,未达阈值,不算火星,存档新图片`)
       const now = Date.now()
       for (const r of results) {
         if (!r.match) await saveImage(gid, session, r.hash, now)
