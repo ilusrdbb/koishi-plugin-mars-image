@@ -13,6 +13,9 @@ export interface Config {
   marsMessage: string
   forwardMessage: string
   forwardMaxImages: number
+  repeatWindowSeconds: number
+  repeatLimit: number
+  cooldownSeconds: number
   statsCommand: string
   statsHeader: string
   statsEmpty: string
@@ -47,6 +50,15 @@ export const Config: Schema<Config> = Schema.object({
   forwardMaxImages: Schema.number()
     .min(1).max(100).step(1).default(30)
     .description('转发卡片最多检测多少张图片,超出部分忽略'),
+  repeatWindowSeconds: Schema.number()
+    .min(0).max(3600).step(1).default(60)
+    .description('复读规避窗口(秒);设为 0 取消规避'),
+  repeatLimit: Schema.number()
+    .min(3).max(100).step(1).default(3)
+    .description('复读规避阈值:同一图片在窗口内被同一人发送达到此次数(含本次)后不计火星;必须大于 2'),
+  cooldownSeconds: Schema.number()
+    .min(0).max(3600).step(1).default(60)
+    .description('火星冷却(秒);同人刚触发火星后在冷却期内再次触发不计火星;设为 0 取消'),
   statsCommand: Schema.string()
     .default('火星统计')
     .description('发送此文本(完全相等)触发统计'),
@@ -103,6 +115,38 @@ export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('mars-images')
   // 阈值(%) -> 允许的最大汉明距离。相似度 = (64 - dist) / 64
   const maxDist = Math.floor((HASH_BITS * (100 - config.threshold)) / 100)
+
+  // 复读规避:key = gid|userId|hash,值为窗口内各次发送时间戳
+  const repeatSends = new Map<string, number[]>()
+  // 火星冷却:key = gid|userId,值为上次记火星时间戳
+  const lastMarsTime = new Map<string, number>()
+
+  function recordRepeatSend(gid: string, userId: string, hash: string, now = Date.now()) {
+    const key = `${gid}|${userId}|${hash}`
+    const arr = repeatSends.get(key) ?? []
+    arr.push(now)
+    repeatSends.set(key, arr)
+  }
+
+  // 同人同图在窗口内已发送达到 repeatLimit 次(含本次)即视为复读
+  function isRepeatSpam(gid: string, userId: string, hash: string, now = Date.now()): boolean {
+    if (config.repeatWindowSeconds <= 0) return false
+    const key = `${gid}|${userId}|${hash}`
+    const arr = repeatSends.get(key) ?? []
+    const cutoff = now - config.repeatWindowSeconds * 1000
+    const recent = arr.filter((t) => t >= cutoff)
+    return recent.length >= config.repeatLimit
+  }
+
+  function isCooldown(gid: string, userId: string, now = Date.now()): boolean {
+    if (config.cooldownSeconds <= 0) return false
+    const last = lastMarsTime.get(`${gid}|${userId}`)
+    return !!last && now - last < config.cooldownSeconds * 1000
+  }
+
+  function markMars(gid: string, userId: string, now = Date.now()) {
+    lastMarsTime.set(`${gid}|${userId}`, now)
+  }
 
   ctx.on('message', async (session) => {
     // 忽略机器人自己的消息,避免自触发
@@ -190,7 +234,13 @@ export function apply(ctx: Context, config: Config) {
     })
   }
 
+  // 记火星前检查冷却;在冷却期内不计火星,也不发提示
   async function notifyMars(session: any, gid: string, match: MarsImageRow, tpl: string, extra: Record<string, string> = {}) {
+    if (isCooldown(gid, session.userId)) {
+      logger.info(`火星冷却中,不计入火星`)
+      return
+    }
+    markMars(gid, session.userId)
     const entry = await incMars(gid, session.userId, session.username)
     if (!config.notify) return
     const msg = renderMars(tpl, {
@@ -204,10 +254,16 @@ export function apply(ctx: Context, config: Config) {
   }
 
   async function processImage(session: any, gid: string, hash: string) {
+    recordRepeatSend(gid, session.userId, hash)
     const rows = await getWindowRows(gid)
     const { match, dist } = findMatch(hash, rows)
 
     if (match) {
+      // 复读规避:同人短时间内反复发同一张图,达到阈值后不再计火星
+      if (isRepeatSpam(gid, session.userId, hash)) {
+        logger.info(`同一图片复读达到 ${config.repeatLimit} 次,不计入火星`)
+        return
+      }
       logger.info(`命中重复,原发送者 ${match.userName},汉明距离 ${dist}`)
       await notifyMars(session, gid, match, config.marsMessage)
     } else {
